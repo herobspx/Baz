@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: join-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 join_bot.py
+    envVars:
+      - key: JOIN_TOKEN
+        sync: false  # set it from Render Dashboard > Environment

@@ -1,0 +1,4 @@
+# Pinned versions that have prebuilt wheels to avoid build failures
+aiogram==2.25.1
+aiohttp[speedups]==3.8.5
+python-dotenv==1.0.1
