@@ -1,179 +1,225 @@
+# join_bot.py
 import os
-import asyncio
 import logging
+from datetime import timedelta
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.exceptions import TelegramBadRequest
+from aiogram.utils import executor
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ContentType
+)
+from aiogram.utils.exceptions import BadRequest  # <-- Aiogram v2.25.1
 
-logging.basicConfig(level=logging.INFO)
+from dotenv import load_dotenv
 
-# ====== الإعدادات من Environment ======
-TOKEN          = os.getenv("JOIN_TOKEN")
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID"))  # مثال: -100xxxxxxxxxx
-ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "0"))  # رقم تيليجرام تبعك
-CHANNEL_LINK   = os.getenv("CHANNEL_LINK")  # اختياري: رابط دعوة جاهز
-IBAN           = os.getenv("IBAN", "SA16301000991104930184574")  # عدّله من Render
+# ============ الإعدادات ============
+load_dotenv()
 
+TOKEN = os.getenv("JOIN_TOKEN")
 if not TOKEN:
     raise RuntimeError("JOIN_TOKEN is missing. Set it in Render > Environment.")
-if not TARGET_CHAT_ID:
+
+# هدف الإضافة (قروب/قناة). مثال: -1003041770290
+TARGET_CHAT_ID_ENV = os.getenv("TARGET_CHAT_ID")
+if not TARGET_CHAT_ID_ENV:
     raise RuntimeError("TARGET_CHAT_ID is missing. Set it in Render > Environment.")
-if not ADMIN_CHAT_ID:
-    raise RuntimeError("ADMIN_CHAT_ID is missing. Set it in Render > Environment.")
+try:
+    TARGET_CHAT_ID = int(TARGET_CHAT_ID_ENV)
+except ValueError:
+    raise RuntimeError("TARGET_CHAT_ID must be an integer chat id (e.g. -100xxxxxxxxxx).")
 
-bot = Bot(token=TOKEN, parse_mode="HTML")
-dp  = Dispatcher(bot)
+# آيبان الدفع لرسالة طريقة الاشتراك
+IBAN = os.getenv("IBAN", "SA00 0000 0000 0000 0000 0000")  # غيّره من المتغيّر بالبيئة
 
-# تتبع من ينتظر إرسال الإيصال
-WAITING_PROOF = set()
-# طلبات قيد المراجعة: {request_id: {"user_id": ..., "proof_msg_id": ..., "chat_id": ...}}
+# مسؤول الموافقة (اختياري لكن مستحسن). ضع Chat ID الخاص بك
+ADMIN_ID = os.getenv("ADMIN_ID")  # example: 302461787
+ADMIN_ID = int(ADMIN_ID) if ADMIN_ID and ADMIN_ID.isdigit() else None
+
+# رابط احتياطي ثابت للقناة/القروب (في حال تعذر إنشاء رابط تلقائي)
+CHANNEL_LINK = os.getenv("CHANNEL_LINK")  # مثال: https://t.me/yourPublicChannel
+
+# ============ بوت/ديسباتشر ============
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
+dp = Dispatcher(bot)
+
+# pending confirmations: user_id -> dict(info)
 PENDING = {}
 
-# ====== الواجهات ======
-def start_kb() -> InlineKeyboardMarkup:
+# ============ مساعدات ============
+def subscribe_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("الاشتراك 🟢", callback_data="subscribe"))
+    kb.add(InlineKeyboardButton("الاشتراك 🟢", callback_data="start_sub"))
     return kb
 
-PAY_TEXT = (
-    "💳 <b>طريقة الاشتراك</b>\n"
-    f"حوِّل الرسوم ١٨٠ ريال إلى الحساب:\n"
-    f"<b>IBAN:</b> <code>{IBAN}</code>\n\n"
-    "ثم أرسل <b>صورة</b> إيصال التحويل هنا.\n"
-)
-
-OK_SENT_TO_ADMIN = "✅ تم استلام الإيصال. بانتظار اعتماد المشرف…"
-REJECTED_TEXT     = "❌ تم رفض الطلب. إذا كان هناك خطأ راسل الدعم."
-APPROVED_TEXT     = "✅ تم اعتماد الطلب. هذا رابط الدعوة (صالح لعضو واحد):\n{link}"
-NEED_SUBSCRIBE_TEXT = "ℹ️ اضغط زر <b>الاشتراك</b> أولًا، ثم أرسل صورة إيصال التحويل."
-
-FAILED_AUTO_LINK_TEXT = (
-    "⚠️ تعذّر إنشاء رابط دعوة تلقائي. تأكد أن البوت مشرف ولديه صلاحية الدعوة."
-)
-
-# ====== إنشاء رابط دعوة لمرة واحدة ======
-async def make_invite_link() -> str:
-    try:
-        link_obj = await bot.create_chat_invite_link(
-            chat_id=TARGET_CHAT_ID,
-            member_limit=1  # دعوة لعضو واحد
-        )
-        return link_obj.invite_link
-    except TelegramBadRequest as e:
-        logging.warning(f"Failed to create invite link automatically: {e}")
-        if CHANNEL_LINK:
-            return CHANNEL_LINK.strip()
-        return None
-
-# ====== Handlers ======
-
-@dp.message_handler(commands=["start"])
-async def cmd_start(msg: types.Message):
-    WAITING_PROOF.discard(msg.from_user.id)
-    text = (
-        "مرحباً 👋\n"
-        "للاشتراك اضغط الزر التالي وستظهر لك طريقة الاشتراك.\n"
-        "بعد التحويل أرسل صورة الإيصال هنا.\n"
+def approve_kb(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ تأكيد", callback_data=f"approve:{user_id}"),
+        InlineKeyboardButton("❌ رفض", callback_data=f"reject:{user_id}")
     )
-    await msg.answer(text, reply_markup=start_kb())
+    return kb
 
-@dp.callback_query_handler(lambda c: c.data == "subscribe")
-async def on_subscribe(cb: types.CallbackQuery):
-    WAITING_PROOF.add(cb.from_user.id)
-    await cb.message.answer(PAY_TEXT)
+async def try_make_invite_link() -> str:
+    """
+    يحاول إنشاء رابط دعوة مؤقت تلقائيًا.
+    يتطلب أن يكون البوت مشرفًا في القروب/القناة بصلاحية 'Invite users'.
+    """
+    try:
+        # حاول إنشاء رابط دعوة صالح لعضو واحد لمدة 24 ساعة
+        link = await bot.create_chat_invite_link(
+            chat_id=TARGET_CHAT_ID,
+            name="Auto by Join Bot",
+            expire_date=timedelta(hours=24),
+            member_limit=1
+        )
+        # في Aiogram 2.x ترجع كائن ChatInviteLink يحتوي .invite_link
+        return link.invite_link
+    except BadRequest as e:
+        logging.warning(f"Failed to create invite link automatically: {e}")
+        # جرّب تصدير رابط دعوة عام (قد يكون دائمًا)
+        try:
+            exported = await bot.export_chat_invite_link(TARGET_CHAT_ID)
+            return exported
+        except BadRequest as e2:
+            logging.warning(f"Fallback export invite failed: {e2}")
+            # آخر حل: استخدم CHANNEL_LINK إن تم ضبطه
+            if CHANNEL_LINK:
+                return CHANNEL_LINK
+            # لم نتمكن من إنشاء رابط
+            return ""
+
+# ============ الأوامر والتعامل ============
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    text = (
+        "مرحبًا 👋\n"
+        "للاشتراك اضغط الزر التالي، وستظهر لك طريقة الاشتراك.\n"
+        "بعد التحويل أرسل <b>صورة إيصال التحويل</b> هنا."
+    )
+    await message.answer(text, reply_markup=subscribe_kb())
+
+@dp.callback_query_handler(lambda c: c.data == "start_sub")
+async def show_payment_info(cb: types.CallbackQuery):
+    text = (
+        "🧾 <b>طريقة الاشتراك</b>\n"
+        "حوِّل الرسوم ١٨٠ ريال إلى الحساب المحدد:\n"
+        f"<b>الآيبان:</b> <code>{IBAN}</code>\n"
+        "ثم أرسل <b>صورة إيصال التحويل</b> هنا.\n\n"
+        "بعد التأكيد سيُرسَل لك رابط دعوة صالح لعضو واحد ✅"
+    )
+    await cb.message.answer(text)
     await cb.answer()
 
-@dp.message_handler(content_types=types.ContentTypes.PHOTO)
-async def on_photo(msg: types.Message):
-    # يقبل الصور فقط إذا المستخدم دخل وضع الاشتراك
-    if msg.from_user.id not in WAITING_PROOF:
-        await msg.answer(NEED_SUBSCRIBE_TEXT)
-        return
+@dp.message_handler(content_types=ContentType.PHOTO)
+async def handle_receipt(message: types.Message):
+    """
+    أي صورة تُعتبر إيصال. نحفظ الطلب ونسأل المشرف للتأكيد.
+    """
+    user_id = message.from_user.id
+    file_id = message.photo[-1].file_id
+    caption = message.caption or ""
 
-    # خزّن طلب بانتظار المراجعة
-    req_id = f"{msg.chat.id}:{msg.message_id}"
-    PENDING[req_id] = {
-        "user_id": msg.from_user.id,
-        "proof_msg_id": msg.message_id,
-        "chat_id": msg.chat.id,
+    # خزّن الطلب بانتظار موافقة المشرف
+    PENDING[user_id] = {
+        "file_id": file_id,
+        "caption": caption,
+        "user_name": message.from_user.full_name,
+        "user_username": f"@{message.from_user.username}" if message.from_user.username else "-",
+        "chat_id": message.chat.id
     }
 
-    # أرسل للمشرف للمراجعة مع أزرار قبول/رفض
-    approve_kb = InlineKeyboardMarkup().add(
-        InlineKeyboardButton("✅ قبول", callback_data=f"approve:{req_id}"),
-        InlineKeyboardButton("❌ رفض",  callback_data=f"reject:{req_id}")
-    )
+    # أرسل للمستخدم إشعارًا مختصرًا
+    await message.reply("✅ تم استلام التأكيد.\nجاري انتظار موافقة المشرف…")
 
-    caption = (
-        f"📥 <b>طلب اشتراك جديد</b>\n"
-        f"👤 المستخدم: <a href='tg://user?id={msg.from_user.id}'>{msg.from_user.first_name}</a>\n"
-        f"🆔 ID: <code>{msg.from_user.id}</code>\n\n"
-        "اعتمد الطلب أو ارفضه:"
-    )
-
-    # أعد إرسال أعلى دقة من الصورة
-    file_id = msg.photo[-1].file_id
-    await bot.send_photo(
-        chat_id=ADMIN_CHAT_ID,
-        photo=file_id,
-        caption=caption,
-        reply_markup=approve_kb,
-        parse_mode="HTML",
-    )
-
-    await msg.answer(OK_SENT_TO_ADMIN)
+    # أرسل للمشرف للموافقة (إذا متاح)، وإلا أنبّه المستخدم أن الموافقة اليدوية مطلوبة
+    if ADMIN_ID:
+        info = PENDING[user_id]
+        txt = (
+            f"طلب اشتراك جديد 🆕\n"
+            f"العضو: <b>{info['user_name']}</b> ({info['user_username']})\n"
+            f"User ID: <code>{user_id}</code>\n\n"
+            "تأكيد الدفع؟"
+        )
+        try:
+            await bot.send_photo(
+                ADMIN_ID,
+                photo=file_id,
+                caption=txt,
+                reply_markup=approve_kb(user_id)
+            )
+        except Exception as e:
+            logging.warning(f"Failed to notify admin: {e}")
+    else:
+        await message.answer("ℹ️ لم يتم ضبط ADMIN_ID، لا يمكن تأكيد الطلب تلقائيًا.")
 
 @dp.callback_query_handler(lambda c: c.data.startswith("approve:") or c.data.startswith("reject:"))
-async def admin_decision(cb: types.CallbackQuery):
-    # السماح فقط لـ ADMIN_CHAT_ID
-    if cb.from_user.id != ADMIN_CHAT_ID:
-        await cb.answer("غير مخوّل.", show_alert=True)
+async def on_review(cb: types.CallbackQuery):
+    action, user_id_str = cb.data.split(":")
+    try:
+        user_id = int(user_id_str)
+    except ValueError:
+        await cb.answer("معرّف غير صالح.", show_alert=True)
         return
 
-    action, req_id = cb.data.split(":", 1)
-    req = PENDING.get(req_id)
-    if not req:
-        await cb.answer("الطلب غير موجود/منتهي.", show_alert=True)
+    # تأكد أن هناك طلبًا قيد الانتظار
+    if user_id not in PENDING:
+        await cb.answer("لا يوجد طلب معلق لهذا المستخدم.", show_alert=True)
         return
-
-    user_id = req["user_id"]
 
     if action == "reject":
-        await bot.send_message(user_id, REJECTED_TEXT)
-        await cb.message.edit_caption(cb.message.caption + "\n\n❌ تم الرفض.")
-        PENDING.pop(req_id, None)
+        # أبلغ المستخدم بالرفض
+        try:
+            await bot.send_message(user_id, "❌ تم رفض طلب الاشتراك. يُرجى التواصل للدعم إن كان ذلك خطأ.")
+        except Exception:
+            pass
+        del PENDING[user_id]
+        await cb.message.edit_caption(cb.message.caption + "\n\nتم الرفض ❌")
         await cb.answer("تم الرفض.")
         return
 
-    # قبول: أنشئ الرابط وأرسله للمستخدم
-    link = await make_invite_link()
-    if not link:
-        await bot.send_message(user_id, FAILED_AUTO_LINK_TEXT + (f"\nبديل: {CHANNEL_LINK}" if CHANNEL_LINK else ""))
-        await cb.message.edit_caption(cb.message.caption + "\n\n⚠️ تعذّر إنشاء رابط تلقائي.")
-        PENDING.pop(req_id, None)
-        await cb.answer("تعذّر إنشاء الرابط.")
+    # موافقة
+    invite = await try_make_invite_link()
+    if not invite:
+        # تعذّر إنشاء رابط
+        try:
+            await bot.send_message(
+                user_id,
+                "❗️ تعذّر إنشاء رابط الدعوة تلقائيًا الآن. "
+                "تأكد أن البوت مشرف بصلاحية دعوة الأعضاء أو وفّر CHANNEL_LINK ثابت."
+            )
+        except Exception:
+            pass
+        await cb.answer("تعذّر إنشاء الرابط.", show_alert=True)
         return
 
-    await bot.send_message(user_id, APPROVED_TEXT.format(link=link))
-    await cb.message.edit_caption(cb.message.caption + "\n\n✅ تم القبول وإرسال الرابط.")
-    PENDING.pop(req_id, None)
-    # خرج المستخدم من وضع الانتظار
-    WAITING_PROOF.discard(user_id)
-    await cb.answer("تم الإرسال.")
+    # أرسل الرابط للمستخدم
+    try:
+        await bot.send_message(
+            user_id,
+            "✅ تم التأكيد.\n"
+            f"هذا رابط الدعوة الخاص بك (صالح لعضو واحد):\n{invite}"
+        )
+    except Exception as e:
+        logging.warning(f"Failed to DM user: {e}")
 
-@dp.message_handler()
-async def on_text(msg: types.Message):
-    if msg.from_user.id in WAITING_PROOF:
-        await msg.answer("📷 أرسل <b>صورة</b> إيصال التحويل لإتمام الطلب.")
-    else:
-        await msg.answer("اكتب /start ثم اضغط زر <b>الاشتراك</b>.")
+    # حدّث رسالة المشرف
+    await cb.message.edit_caption(cb.message.caption + "\n\nتمت الموافقة ✅")
+    await cb.answer("تمت الموافقة وإرسال الرابط.")
 
-# ====== تشغيل البوت ======
-async def main():
-    logging.info("Starting Join bot…")
-    me = await bot.get_me()
-    logging.info(f"Bot: {me.first_name} [@{me.username}]")
-    await dp.start_polling()
+    # أزل من قائمة الانتظار
+    PENDING.pop(user_id, None)
 
+# حماية من الرسائل النصية العشوائية
+@dp.message_handler(content_types=ContentType.TEXT)
+async def echo_info(message: types.Message):
+    # اختصار الرسائل كي لا تتسبب في MESSAGE_TOO_LONG
+    if message.text.strip().startswith("/"):
+        return
+    await message.answer("أرسل /start أو صورة إيصال التحويل للمتابعة.")
+
+# ============ تشغيل ============
 if __name__ == "__main__":
-    asyncio.run(main())
+    logging.info("Starting Join bot…")
+    executor.start_polling(dp, skip_updates=True)
