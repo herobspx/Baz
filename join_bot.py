@@ -1,132 +1,152 @@
-# -*- coding: utf-8 -*-
+# join_bot.py
 import os
-import logging
-from datetime import timedelta, datetime
+import asyncio
+from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
+from aiogram import Bot, Dispatcher, executor, types
+from dotenv import load_dotenv
 
-# -------------------- إعدادات وقراءة المتغيرات --------------------
-JOIN_TOKEN = os.getenv("JOIN_TOKEN")           # توكن بوت الاشتراك
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")   # رقم القناة/المجموعة الهدف
-CHANNEL_LINK = os.getenv("CHANNEL_LINK")       # رابط عام احتياطي (اختياري)
+# ===== إعدادات عامة =====
+load_dotenv()
+TOKEN = os.getenv("JOIN_TOKEN")
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")  # مثال: -1001234567890
+FALLBACK_CHANNEL_LINK = os.getenv("CHANNEL_LINK")  # اختياري: رابط دعوة جاهز
+ADMIN_ID = os.getenv("ADMIN_ID")  # اختياري: تيليجرام ID للمشرف لتلقي إنذارات
 
-if not JOIN_TOKEN:
+if not TOKEN:
     raise RuntimeError("JOIN_TOKEN is missing. Set it in Render > Environment.")
-
 if not TARGET_CHAT_ID:
     raise RuntimeError("TARGET_CHAT_ID is missing. Set it in Render > Environment.")
 
-try:
-    TARGET_CHAT_ID = int(TARGET_CHAT_ID)
-except ValueError:
-    raise RuntimeError("TARGET_CHAT_ID must be an integer (e.g. -1001234567890).")
+bot = Bot(token=TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("join-bot")
+# حالة بسيطة بالذاكرة: من ينتظر إرسال إيصال
+pending_photo = {}  # {user_id: expires_at(datetime)}
 
-bot = Bot(
-    token=JOIN_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher(storage=MemoryStorage())
+# ===== أدوات مساعدة =====
+MAX_CHARS = 4000
 
-# -------------------- الحالات --------------------
-class JoinFlow(StatesGroup):
-    waiting_receipt = State()  # انتظار صورة إيصال التحويل
+async def chunk_and_send(chat_id: int, text: str, reply_markup=None):
+    """قسّم الرسالة الطويلة تلقائياً وأرسلها على دفعات."""
+    if len(text) <= MAX_CHARS:
+        await bot.send_message(chat_id, text, reply_markup=reply_markup)
+        return
+    chunks = [text[i:i+MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
+    # أرسل أول جزء مع الكيبورد (إن وجد) والبقية بدون
+    for i, chunk in enumerate(chunks):
+        await bot.send_message(chat_id, chunk, reply_markup=reply_markup if i == 0 else None)
 
-# -------------------- أدوات --------------------
-def subscribe_button() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.add(InlineKeyboardButton(text="🟢 الاشتراك", callback_data="subscribe"))
-    return kb.as_markup()
+async def notify_admin(text: str):
+    if ADMIN_ID:
+        try:
+            await bot.send_message(int(ADMIN_ID), f"⚠️ {text}")
+        except Exception:
+            pass
 
-async def send_payment_instructions(event):
-    text = (
-        "💳 <b>طريقة الاشتراك</b>\n"
-        "حوّل الرسوم إلى الحساب المحدد (البنك العربي الوطني)\n"
-        "<code>SA163010009911049301084574</code>\n"
-        "ثم أرسل <b>صورة إيصال التحويل هنا</b>.\n\n"
-        "بعد التأكيد سترسل لك المنظومة <b>رابط دعوة صالح لعضو واحد ✅</b>."
-    )
-    await event.answer(text) if isinstance(event, CallbackQuery) else await event.reply(text)
-
-async def create_invite_link():
+async def create_single_use_invite() -> str | None:
     """
-    محاولة إنشاء رابط دعوة لعضو واحد، وإن فشلت نرجع الرابط الاحتياطي CHANNEL_LINK إن وجد.
+    يحاول إنشاء رابط دعوة صالح لعضو واحد فقط.
+    يتطلب أن يكون البوت مشرفاً في المجموعة/القناة مع صلاحية إنشاء الروابط.
     """
     try:
-        # مدة صلاحية 24 ساعة (اختياري)
-        expire_date = datetime.utcnow() + timedelta(hours=24)
+        # member_limit=1 يجعل الرابط صالحاً لشخص واحد
         link = await bot.create_chat_invite_link(
-            chat_id=TARGET_CHAT_ID,
-            name="AutoInvite by JoinBot",
-            expire_date=expire_date,
+            chat_id=int(TARGET_CHAT_ID),
             member_limit=1,
-            creates_join_request=False
+            expire_date=int((datetime.utcnow() + timedelta(minutes=10)).timestamp())
         )
         return link.invite_link
-    except TelegramBadRequest as e:
-        logger.warning(f"Failed to create invite link automatically: {e}")
-        # fallback إلى الرابط العام إن تم وضعه
-        if CHANNEL_LINK:
-            return CHANNEL_LINK
-        # لا يوجد رابط بديل
+    except Exception as e:
+        await notify_admin(f"تعذر إنشاء رابط تلقائي: {e}")
         return None
 
-# -------------------- المعالجات --------------------
-@dp.message(F.text == "/start")
-async def on_start(msg: Message, state: FSMContext):
-    await state.clear()
-    welcome = (
-        "مرحبًا 👋\n"
-        "للاشتراك اضغط الزر التالي، وستظهر لك طريقة الاشتراك.\n"
-        "بعد التحويل أرسل صورة تأكيد هنا."
-    )
-    await msg.answer(welcome, reply_markup=subscribe_button())
+# ===== الرسائل الثابتة (قصيرة) =====
+WELCOME = (
+    "مرحباً 👋\n"
+    "للاشتراك اضغط الزر التالي، ستظهر لك طريقة الاشتراك.\n"
+    "بعد التحويل أرسل صورة إيصال التحويل هنا."
+)
 
-@dp.callback_query(F.data == "subscribe")
-async def on_subscribe(cb: CallbackQuery, state: FSMContext):
-    await send_payment_instructions(cb)
-    await state.set_state(JoinFlow.waiting_receipt)
-    await cb.answer()  # لإغلاق الدائرة الصغيرة
+METHOD = (
+    "🧾 <b>طريقة الاشتراك</b>\n"
+    "حوِّل الرسوم إلى الحساب المحدّد ثم أرسل صورة إيصال التحويل هنا.\n"
+    "بعد التحقق سترسل لك المنظومة رابط الدعوة (لعضو واحد)."
+)
 
-@dp.message(JoinFlow.waiting_receipt, F.photo)
-async def on_receipt(msg: Message, state: FSMContext):
-    await msg.reply("✅ تم استلام التأكيد.\nجاري إنشاء رابط الدعوة…")
-    invite = await create_invite_link()
+SUCCESS_RECEIVED = (
+    "✅ تم استلام التأكيد.\n"
+    "جاري إنشاء رابط الدعوة…"
+)
+
+FALLBACK_MSG = (
+    "⚠️ تعذر إنشاء رابط تلقائي.\n"
+    "يمكنك الانضمام عبر الرابط التالي:\n{link}"
+)
+
+PERMISSION_HINT = (
+    "⚠️ ملاحظة إدارية: تأكد أن البوت مشرف في القناة/المجموعة مع صلاحية دعوة المستخدمين."
+)
+
+# ===== الأزرار =====
+def start_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("الاشتراك 🟢", callback_data="subscribe"))
+    return kb
+
+# ===== المعالجات =====
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    await chunk_and_send(message.chat.id, WELCOME, reply_markup=start_keyboard())
+
+@dp.callback_query_handler(lambda c: c.data == "subscribe")
+async def cb_subscribe(query: types.CallbackQuery):
+    user_id = query.from_user.id
+    # المستخدم لديه 15 دقيقة لإرسال الإيصال
+    pending_photo[user_id] = datetime.utcnow() + timedelta(minutes=15)
+    await chunk_and_send(query.message.chat.id, METHOD)
+    # تلميح إداري لمرة واحدة
+    await notify_admin(PERMISSION_HINT)
+    await query.answer()  # لإغلاق "Loading…"
+
+@dp.message_handler(content_types=["photo"])
+async def handle_receipt(message: types.Message):
+    user_id = message.from_user.id
+    # تحقق أن البوت ينتظر إيصالاً من هذا المستخدم
+    expires = pending_photo.get(user_id)
+    if not expires or datetime.utcnow() > expires:
+        # ليس في وضع الاشتراك
+        await message.reply("أرسل /start ثم اختر الاشتراك.")
+        return
+
+    # (يمكنك هنا إضافة تحقق يدوي/تلقائي من الصورة إن رغبت)
+    await message.reply(SUCCESS_RECEIVED)
+
+    # حاول إنشاء رابط لمرة واحدة
+    invite = await create_single_use_invite()
+
     if invite:
-        await msg.answer(
-            "تفضل رابط الدعوة (صالح لعضو واحد):\n"
-            f"<a href=\"{invite}\">{invite}</a>\n\n"
-            "إذا لم يعمل الرابط جرّب فتحه مباشرة من تيليجرام."
-        )
-        await state.clear()
+        await message.answer(f"🎟️ <b>رابط الدعوة:</b>\n{invite}")
+    elif FALLBACK_CHANNEL_LINK:
+        await message.answer(FALLBACK_MSG.format(link=FALLBACK_CHANNEL_LINK))
     else:
-        await msg.answer(
-            "⚠️ تعذّر إنشاء رابط الدعوة تلقائيًا ولا يوجد رابط احتياطي CHANNEL_LINK.\n"
-            "تأكد من أن البوت مشرف في القناة/المجموعة مع صلاحية إنشاء الروابط، "
-            "أو أضف متغيّر <code>CHANNEL_LINK</code> في Render وأعد المحاولة."
+        await message.answer(
+            "❌ تعذر إنشاء رابط الدعوة تلقائياً، ولا يوجد رابط بديل محدد.\n"
+            "يرجى المحاولة لاحقاً."
         )
 
-@dp.message(JoinFlow.waiting_receipt)
-async def on_non_photo_in_wait(msg: Message):
-    await msg.reply("أرسل <b>صورة إيصال التحويل</b> من فضلك.")
+    # إزالة الحالة
+    pending_photo.pop(user_id, None)
 
-# احتياط: أي رسالة أخرى
-@dp.message()
-async def fallback(msg: Message):
-    await msg.answer("أرسل /start لبدء الاشتراك.")
+@dp.errors_handler()
+async def errors_handler(update, error):
+    # أهم خطأ كان MESSAGE_TOO_LONG – الكود الحالي يعالجه بالتقسيم، ومع ذلك نسجل أي أخطاء
+    try:
+        await notify_admin(f"Error: {error}")
+    finally:
+        return True  # منع تتبع مطوّل في اللوج
 
-# -------------------- التشغيل --------------------
+# ===== التشغيل =====
 if __name__ == "__main__":
-    dp.run_polling(bot)
+    # ملاحظة: اجعل أمر التشغيل في Render = python3 join_bot.py
+    executor.start_polling(dp, skip_updates=True)
