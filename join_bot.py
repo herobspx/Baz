@@ -1,48 +1,23 @@
-    import asyncio
-    import logging
-    import os
+# join_bot.py
+import os
+import asyncio
+from aiogram import Bot, Dispatcher, executor, types
 
-    from aiogram import Bot, Dispatcher, executor, types
-    from aiogram.client.default import DefaultBotProperties
+TOKEN = os.getenv("JOIN_TOKEN")
+if not TOKEN or not isinstance(TOKEN, str):
+    raise RuntimeError("JOIN_TOKEN is missing. Set it in Render > Environment.")
 
-    # Read token from environment variable
-    JOIN_TOKEN = os.getenv("JOIN_TOKEN")
+bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML)
+dp = Dispatcher(bot)
 
-    if not JOIN_TOKEN:
-        raise RuntimeError("Environment variable JOIN_TOKEN is missing!")
+@dp.message_handler(commands=["start", "help"])
+async def cmd_start(message: types.Message):
+    await message.answer("البوت شغّال ✅\nأرسل أي رسالة هنا للتجربة.")
 
-    # Configure logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger("join-bot")
+@dp.message_handler()
+async def echo(message: types.Message):
+    await message.reply(f"استقبلت: <b>{message.text}</b>")
 
-    # Create bot with default parse_mode to avoid aiogram 3.x signature issues
-    bot = Bot(token=JOIN_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher(bot)
-
-    # --- Handlers ---
-
-    @dp.message_handler(commands=["start", "help"])
-    async def handle_start(message: types.Message):
-        await message.answer("✅ البوت شغّال.
-أرسل أي رسالة للتجربة أو اكتب /ping")
-
-    @dp.message_handler(commands=["ping"])
-    async def handle_ping(message: types.Message):
-        await message.reply("pong 🟢")
-
-    @dp.message_handler()
-    async def echo(message: types.Message):
-        # Simple echo for smoke test
-        await message.answer(f"سمعتك: <b>{types.utils.markdown.quote_html(message.text)}</b>")
-
-    # --- Keepalive (optional) ---
-    async def keepalive():
-        while True:
-            # Just sleep; Render keeps the worker running while the process is alive
-            await asyncio.sleep(60)
-
-    if __name__ == "__main__":
-        # Start polling
-        loop = asyncio.get_event_loop()
-        loop.create_task(keepalive())
-        executor.start_polling(dp, skip_updates=True)
+if __name__ == "__main__":
+    # تشغيل البولِّنج
+    executor.start_polling(dp, skip_updates=True)
