@@ -1,314 +1,226 @@
+# join_bot.py
 # -*- coding: utf-8 -*-
+
 import os
-import time
-import sqlite3
 import asyncio
 import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
-from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton, ParseMode
-)
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatInviteLink
+from aiogram.utils.exceptions import TelegramAPIError, BadRequest
 
-# ================== الإعدادات من المتغيرات البيئية ==================
-BOT_TOKEN     = os.getenv("JOIN_TOKEN")
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")  # مثال: -1001234567890 (مجموعة/سوبرجروب)
-ADMIN_ID       = int(os.getenv("ADMIN_ID", "0"))  # آي دي المشرف الذي يستقبل الطلبات
-CHANNEL_LINK   = os.getenv("CHANNEL_LINK", "")    # رابط بديل ثابت عند فشل إنشاء رابط تلقائي
-
-BANK_NAME      = os.getenv("BANK_NAME", "البنك العربي الوطني")
-ACCOUNT_NAME   = os.getenv("ACCOUNT_NAME", "بدر محمد الجعيد")
-IBAN           = os.getenv("IBAN", "SA1630100991104930184574")
-
-DEFAULT_DAYS   = int(os.getenv("DEFAULT_SUB_DAYS", "30"))  # مدة الاشتراك الافتراضية
-
-if not BOT_TOKEN:
-    raise RuntimeError("JOIN_TOKEN مفقود. ضعه في Render > Environment.")
-
-if not TARGET_CHAT_ID:
-    raise RuntimeError("TARGET_CHAT_ID مفقود. ضعه في Render > Environment.")
-
-try:
-    TARGET_CHAT_ID = int(TARGET_CHAT_ID)
-except Exception:
-    raise RuntimeError("TARGET_CHAT_ID يجب أن يكون رقمًا (مثل -100xxxxxxxxxx).")
-
-# ================== ضبط اللوج ==================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("join-bot")
 
-# ================== تهيئة البوت ==================
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher(bot)
+# ========= الإعدادات من متغيرات البيئة =========
+JOIN_TOKEN      = os.getenv("JOIN_TOKEN")            # توكن البوت
+TARGET_CHAT_ID  = os.getenv("TARGET_CHAT_ID")        # آي دي الجروب/القناة (مثال: -1003041770290)
+ADMIN_ID        = os.getenv("ADMIN_ID")              # آي دي الأدمن الذي يستقبل الطلبات
+CHANNEL_LINK    = os.getenv("CHANNEL_LINK")          # (اختياري) رابط ثابت بديل إن لم يقدر البوت ينشئ دعوة
+SUB_DAYS        = int(os.getenv("SUB_DAYS", "30"))   # مدة الاشتراك بالأيام
 
-# ================== قاعدة البيانات ==================
-DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cur  = conn.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS subscriptions (
-    user_id    INTEGER PRIMARY KEY,
-    expires_at INTEGER NOT NULL
-)
-""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS pending (
-    user_id    INTEGER PRIMARY KEY,
-    msg_id     INTEGER,
-    sent_at    INTEGER NOT NULL
-)
-""")
-conn.commit()
+if not JOIN_TOKEN:
+    raise RuntimeError("JOIN_TOKEN is missing. Set it in Render > Environment.")
+if not TARGET_CHAT_ID:
+    raise RuntimeError("TARGET_CHAT_ID is missing. Set it in Render > Environment.")
 
-def set_subscription(user_id: int, days: int):
-    expires = int(time.time()) + days * 86400
-    cur.execute("INSERT OR REPLACE INTO subscriptions(user_id, expires_at) VALUES(?,?)",
-                (user_id, expires))
-    conn.commit()
-    return expires
+bot = Bot(token=JOIN_TOKEN, parse_mode="HTML", disable_web_page_preview=True)
+dp  = Dispatcher(bot)
 
-def get_subscription(user_id: int):
-    row = cur.execute("SELECT expires_at FROM subscriptions WHERE user_id=?",
-                      (user_id,)).fetchone()
-    return row[0] if row else None
+# ====== ذاكرة بسيطة لحفظ الاشتراكات (غير دائمة) ======
+# { user_id: expiry_datetime }
+subscriptions = {}
 
-def remove_subscription(user_id: int):
-    cur.execute("DELETE FROM subscriptions WHERE user_id=?", (user_id,))
-    conn.commit()
-
-# ================== الرسائل الجاهزة ==================
+# ====== رسائل الواجهة (مخصصة بالعربي) ======
 WELCOME_TEXT = (
-    "مرحباً 👋\n"
+    "مرحبًا 👋\n"
     "للاشتراك اضغط الزر التالي، وستظهر لك طريقة الاشتراك.\n"
     "بعد التحويل أرسل <b>صورة إيصال التحويل هنا</b>."
 )
 
-def payment_text():
-    return (
-        "طريقة الاشتراك 🧾\n"
-        f"حوِّل الرسوم <b>180 ريال</b> إلى الحساب المحدد:\n"
-        f"<b>البنك:</b> {BANK_NAME}\n"
-        f"<b>اسم صاحب الحساب:</b> {ACCOUNT_NAME}\n"
-        f"<b>الآيبان:</b> <code>{IBAN}</code>\n\n"
-        "ثم أرسل <b>صورة إيصال التحويل هنا</b>.\n\n"
-        "بعد التأكيد سيُرسَل لك رابط دعوة صالح لعضو واحد ✅"
-    )
-
-def format_exp(ts: int):
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-
-subscribe_kb = InlineKeyboardMarkup().add(
-    InlineKeyboardButton("الاشتراك 🟢", callback_data="open_payment")
+METHOD_TEXT = (
+    "<b>طريقة الاشتراك 🧾</b>\n"
+    "حوِّل الرسوم <b>180 ريال</b> إلى الحساب المحدد:\n"
+    "<b>البنك:</b> البنك العربي الوطني\n"
+    "<b>اسم صاحب الحساب:</b> بدر محمد الجعيد\n"
+    "<b>الآيبان:</b> <code>SA1630100991104930184574</code>\n"
+    "ثم أرسل صورة إيصال التحويل هنا.\n\n"
+    "بعد التأكيد سيُرسَل لك رابط دعوة صالح لعضو واحد ✅"
 )
 
-# ================== الأوامر العامة ==================
-@dp.message_handler(commands=["start", "help"])
-async def start_cmd(msg: types.Message):
-    await msg.answer(WELCOME_TEXT, reply_markup=subscribe_kb)
+SUBSCRIBE_KB = InlineKeyboardMarkup().add(
+    InlineKeyboardButton("الاشتراك 🟢", callback_data="subscribe")
+)
 
-@dp.callback_query_handler(lambda c: c.data == "open_payment")
-async def show_payment(call: types.CallbackQuery):
-    await call.message.answer(payment_text())
+# ====== أدوات ======
+def human(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
 
-# ================== استقبال إيصالات التحويل ==================
-@dp.message_handler(content_types=types.ContentTypes.PHOTO)
-async def handle_receipt(msg: types.Message):
-    user = msg.from_user
-    cap = (msg.caption or "").strip()
-    # نسجّل الطلب كـ pending
-    cur.execute("INSERT OR REPLACE INTO pending(user_id, msg_id, sent_at) VALUES(?,?,?)",
-                (user.id, msg.message_id, int(time.time())))
-    conn.commit()
+async def try_create_invite_link() -> str:
+    """
+    يحاول إنشاء رابط دعوة مؤقت (صالح لمرّة واحدة) للجروب/القناة.
+    إن فشل (ليس مشرف/قناة خاصة/الصلاحيات ناقصة)، يستخدم CHANNEL_LINK إن وجد.
+    """
+    # إن كان هناك رابط ثابت مضاف بالبيئة نُعيده مباشرةً
+    if CHANNEL_LINK:
+        return CHANNEL_LINK
 
-    # نرسل للمستخدم تأكيد الاستلام
-    await msg.reply("✅ تم استلام التأكيد.\nجاري انتظار موافقة المشرف…")
+    try:
+        link: ChatInviteLink = await bot.create_chat_invite_link(
+            chat_id=int(TARGET_CHAT_ID),
+            expire_date=None,           # بدون انتهاء (الإدارة تحذف يدويًا إن رغبت)
+            member_limit=1,             # صالح لعضو واحد
+            creates_join_request=False  # دعوة مباشرة
+        )
+        return link.invite_link
+    except (BadRequest, TelegramAPIError) as e:
+        log.warning(f"Failed to create invite link automatically: {e}")
+        # رجوع لرابط ثابت إن تم توفيره لاحقًا
+        if CHANNEL_LINK:
+            return CHANNEL_LINK
+        # إن لم يتوفر، نخبر الأدمن لاحقًا داخل منطق الموافقة
+        return ""
 
-    # نُرسِل للمشرف الصورة مع أزرار الموافقة / الرفض
-    kb = InlineKeyboardMarkup(row_width=3)
-    kb.add(
-        InlineKeyboardButton("قبول 7 أيام", callback_data=f"approve:{user.id}:7"),
-        InlineKeyboardButton("قبول 30 يومًا", callback_data=f"approve:{user.id}:30"),
-        InlineKeyboardButton("رفض", callback_data=f"reject:{user.id}")
+async def add_or_invite_user(user_id: int) -> str:
+    """
+    في القنوات/المجموعات الخاصة: الأفضل إرسال رابط دعوة.
+    """
+    invite = await try_create_invite_link()
+    return invite
+
+# ====== أوامر ومعالجات ======
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    await message.answer(WELCOME_TEXT, reply_markup=SUBSCRIBE_KB)
+
+@dp.callback_query_handler(lambda c: c.data == "subscribe")
+async def cb_subscribe(call: types.CallbackQuery):
+    await call.message.answer(METHOD_TEXT)
+
+@dp.message_handler(content_types=types.ContentType.PHOTO)
+async def on_payment_proof(message: types.Message):
+    """
+    المستخدم يرسل صورة إيصال التحويل:
+    - نؤكد الاستلام للمستخدم.
+    - نرسل للإدمن رسالة تحتوي أزرار (موافقة/رفض).
+    """
+    user = message.from_user
+    await message.reply("✅ تم استلام التأكيد.\nجاري انتظار موافقة المشرف…")
+
+    if not ADMIN_ID:
+        # لا نوقف التدفق تمامًا، لكن نُعلم المستخدم أن الموافقة اليدوية غير مفعلة
+        await message.answer(
+            "ℹ️ لا يمكن تأكيد الطلب تلقائيًا، لم يتم ضبط ADMIN_ID.\n"
+            "سيتم مراجعته يدويًا."
+        )
+        return
+
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✅ موافقة", callback_data=f"approve:{user.id}"),
+        InlineKeyboardButton("❌ رفض", callback_data=f"reject:{user.id}")
     )
-    text = (
-        f"💳 <b>طلب اشتراك جديد</b>\n"
-        f"العضو: <a href='tg://user?id={user.id}'>{user.full_name}</a> (<code>{user.id}</code>)\n"
-        f"نص الإيصال: {cap if cap else '—'}\n"
-        f"أرسل الموافقة مع المدة:"
+
+    caption = (
+        f"<b>طلب اشتراك جديد</b>\n"
+        f"العميل: <a href='tg://user?id={user.id}'>{user.full_name}</a> (ID: <code>{user.id}</code>)\n"
+        f"التاريخ: {human(datetime.utcnow())} UTC\n\n"
+        f"الرجاء التأكيد."
     )
+    # إعادة إرسال صورة الإيصال للأدمن مع الأزرار
+    photo = message.photo[-1].file_id
     try:
         await bot.send_photo(
-            chat_id=ADMIN_ID,
-            photo=msg.photo[-1].file_id,
-            caption=text,
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML
+            chat_id=int(ADMIN_ID),
+            photo=photo,
+            caption=caption,
+            reply_markup=kb
         )
-    except Exception as e:
-        log.warning(f"لم أتمكن من إرسال الطلب للمشرف: {e}")
-
-# ================== أزرار المشرف (اعتماد/رفض) ==================
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID and (user_id == ADMIN_ID)
+    except TelegramAPIError:
+        # لو ما قدر يرسل صورة، يرسل نص
+        await bot.send_message(
+            chat_id=int(ADMIN_ID),
+            text=caption,
+            reply_markup=kb
+        )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("approve:"))
-async def approve_cb(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("غير مخوّل.", show_alert=True)
+async def cb_approve(call: types.CallbackQuery):
+    """
+    الأدمن ضغط موافقة:
+    - نحسب نهاية الاشتراك.
+    - نرسل للمستخدم رابط دعوة.
+    - نخزن وقت الانتهاء في الذاكرة.
+    """
+    if not ADMIN_ID or call.from_user.id != int(ADMIN_ID):
+        await call.answer("غير مصرح.", show_alert=True)
+        return
 
-    _, uid_str, days_str = call.data.split(":")
-    target_uid = int(uid_str)
-    days = int(days_str)
+    target_user_id = int(call.data.split(":")[1])
+    expires_at = datetime.utcnow() + timedelta(days=SUB_DAYS)
+    subscriptions[target_user_id] = expires_at
 
-    # نحاول إنشاء رابط دعوة لمرة واحدة مع انتهاء صلاحية 24 ساعة
-    invite_link = None
-    try:
-        expire_date = int(time.time()) + 24 * 3600
-        link = await bot.create_chat_invite_link(
-            chat_id=TARGET_CHAT_ID, expire_date=expire_date, member_limit=1,
-            name=f"Auto-{target_uid}"
+    invite_link = await add_or_invite_user(target_user_id)
+    if not invite_link:
+        await call.message.answer("⚠️ تعذّر إنشاء رابط الدعوة تلقائيًا. تأكد من صلاحيات البوت أو أضف CHANNEL_LINK.")
+        await bot.send_message(
+            target_user_id,
+            "⚠️ حدثت مشكلة في إنشاء رابط الدعوة تلقائيًا. سيتم إرسال الرابط لاحقًا بعد معالجة المشرف."
         )
-        invite_link = link.invite_link
-    except Exception as e:
-        log.warning(f"فشل إنشاء رابط تلقائي: {e}")
-        if CHANNEL_LINK:
-            invite_link = CHANNEL_LINK
+        await call.answer("تم تسجيل الموافقة ولكن فشل إنشاء الرابط.", show_alert=True)
+        return
 
-    # نخزن الاشتراك
-    exp = set_subscription(target_uid, days)
-
-    # نخبر المشرف
-    await call.message.reply(
-        f"✅ تم اعتماد اشتراك <code>{target_uid}</code> لمدة {days} يومًا.\n"
-        f"ينتهي في: <code>{format_exp(exp)}</code>\n"
-        f"{'🔗 أُنشئ رابط تلقائي وأُرسل للمستخدم.' if invite_link else '⚠️ لم أستطع إنشاء رابط.'}"
+    await bot.send_message(
+        target_user_id,
+        f"🎟️ تم تأكيد اشتراكك!\n"
+        f"رابط الدعوة (صالح لعضو واحد):\n{invite_link}\n\n"
+        f"📅 ينتهي الاشتراك في: {human(expires_at)} UTC"
     )
-
-    # نرسل للمستخدم
-    try:
-        if invite_link:
-            await bot.send_message(
-                target_uid,
-                "✅ تم تأكيد اشتراكك.\n"
-                "اضغط على الرابط التالي للانضمام (صالح لعضو واحد):\n"
-                f"{invite_link}"
-            )
-        else:
-            await bot.send_message(
-                target_uid,
-                "✅ تم تأكيد اشتراكك.\n"
-                "تعذّر إنشاء رابط تلقائي. سيتواصل معك المشرف بالرابط قريبًا."
-            )
-    except Exception as e:
-        await call.message.reply(f"تعذّر مراسلة المستخدم: {e}")
-
-    await call.answer("تم.")
+    await call.answer("تمت الموافقة وإرسال الرابط ✅", show_alert=False)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("reject:"))
-async def reject_cb(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("غير مخوّل.", show_alert=True)
-
-    _, uid_str = call.data.split(":")
-    target_uid = int(uid_str)
-    remove_subscription(target_uid)
-
-    try:
-        await bot.send_message(target_uid, "❌ تم رفض الطلب. تأكد من بيانات التحويل وحاول مجددًا.")
-    except:
-        pass
-
-    await call.message.reply(f"تم رفض طلب <code>{target_uid}</code>.")
-    await call.answer("تم.")
-
-# ================== أوامر المشرف ==================
-@dp.message_handler(commands=["users"])
-async def list_users(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+async def cb_reject(call: types.CallbackQuery):
+    if not ADMIN_ID or call.from_user.id != int(ADMIN_ID):
+        await call.answer("غير مصرح.", show_alert=True)
         return
-    rows = cur.execute("SELECT user_id, expires_at FROM subscriptions ORDER BY expires_at ASC LIMIT 50").fetchall()
-    if not rows:
-        return await msg.reply("لا يوجد مشتركون حالياً.")
-    lines = ["<b>المشتركون:</b>"]
-    now = int(time.time())
-    for uid, exp in rows:
-        status = "✅ ساري" if exp > now else "⛔️ منتهي"
-        lines.append(f"- <code>{uid}</code> ينتهي: <code>{format_exp(exp)}</code> {status}")
-    await msg.reply("\n".join(lines), parse_mode=ParseMode.HTML)
+    target_user_id = int(call.data.split(":")[1])
+    subscriptions.pop(target_user_id, None)
+    await bot.send_message(target_user_id, "❌ تم رفض الطلب. إن كان هناك خطأ تواصل مع الدعم.")
+    await call.answer("تم الرفض.", show_alert=False)
 
-@dp.message_handler(commands=["renew"])
-async def renew_cmd(msg: types.Message):
-    if not is_admin(msg.from_user.id):
-        return
-    try:
-        _, uid_str, days_str = msg.text.strip().split()
-        uid = int(uid_str); days = int(days_str)
-    except:
-        return await msg.reply("الاستخدام: /renew USER_ID DAYS")
-    current = get_subscription(uid) or int(time.time())
-    new_exp = current + days * 86400
-    cur.execute("INSERT OR REPLACE INTO subscriptions(user_id, expires_at) VALUES(?,?)", (uid, new_exp))
-    conn.commit()
-    await msg.reply(f"تم التجديد لـ <code>{uid}</code> حتى {format_exp(new_exp)}.", parse_mode=ParseMode.HTML)
-
-@dp.message_handler(commands=["ban"])
-async def ban_cmd(msg: types.Message):
-    if not is_admin(msg.from_user.id):
-        return
-    try:
-        _, uid_str = msg.text.strip().split()
-        uid = int(uid_str)
-    except:
-        return await msg.reply("الاستخدام: /ban USER_ID")
-    # محاولة إزالة من المجموعة
-    try:
-        # الأسماء تختلف بين الإصدارات؛ نحاول الطريقتين
-        try:
-            await bot.kick_chat_member(TARGET_CHAT_ID, uid)
-        except:
-            await bot.ban_chat_member(TARGET_CHAT_ID, uid)
-    except Exception as e:
-        await msg.reply(f"تعذّر إزالة المستخدم: {e}")
-    remove_subscription(uid)
-    await msg.reply(f"تم حظر <code>{uid}</code> وإزالة اشتراكه.", parse_mode=ParseMode.HTML)
-
-# ================== مهمة دورية: إزالة المنتهي اشتراكهم ==================
+# ====== مراقبة صلاحية الاشتراكات ======
 async def expiry_watcher():
-    await bot.wait_until_ready() if hasattr(bot, "wait_until_ready") else asyncio.sleep(0)
+    """
+    يفحص كل دقيقة المستخدمين المنتهية اشتراكاتهم ويُبلغ الأدمن (إزالة العضو تتم يدويًا عبر التليجرام).
+    يمكن لاحقًا ربطه بإزالة تلقائية إن كان البوت له صلاحية مناسبة ومجموعة (وليس قناة).
+    """
     while True:
         try:
-            now = int(time.time())
-            rows = cur.execute("SELECT user_id FROM subscriptions WHERE expires_at <= ?", (now,)).fetchall()
-            for (uid,) in rows:
-                try:
-                    try:
-                        await bot.kick_chat_member(TARGET_CHAT_ID, uid)
-                    except:
-                        await bot.ban_chat_member(TARGET_CHAT_ID, uid)
-                except Exception as e:
-                    log.info(f"تعذرت إزالة {uid}: {e}")
-                remove_subscription(uid)
-                try:
-                    await bot.send_message(uid, "⛔️ انتهى اشتراكك وتمت إزالتك من المجموعة.")
-                except:
-                    pass
+            now = datetime.utcnow()
+            to_remove = [uid for uid, exp in subscriptions.items() if exp <= now]
+            for uid in to_remove:
+                subscriptions.pop(uid, None)
+                # مجرد تنبيه — الإزالة الفعلية من القنوات الخاصة غير مدعومة مباشرة عبر البوت دائمًا.
+                if ADMIN_ID:
+                    await bot.send_message(
+                        int(ADMIN_ID),
+                        f"⌛ انتهى اشتراك المستخدم ID: <code>{uid}</code>. الرجاء إزالة الوصول إذا كان عضوًا."
+                    )
         except Exception as e:
-            log.warning(f"Watcher error: {e}")
-        await asyncio.sleep(60)  # افحص كل دقيقة
+            log.error(f"expiry_watcher error: {e}")
+        await asyncio.sleep(60)
 
-# ================== تشغيل البوت ==================
-async def on_startup(dp):
-    # رسالة للمشرف عند التشغيل
+# ====== تشغيل البوت ======
+async def on_startup(dp: Dispatcher):
     try:
         if ADMIN_ID:
-            await bot.send_message(ADMIN_ID, "✅ Bot started.")
-    except:
+            await bot.send_message(int(ADMIN_ID), "✅ Bot started.")
+    except Exception:
         pass
-    # شغّل المراقب
-    dp.loop.create_task(expiry_watcher())
+    # المهم: استخدام asyncio.create_task بدلاً من dp.loop.create_task
+    asyncio.create_task(expiry_watcher())
 
 if __name__ == "__main__":
-    log.info(f"Bot: Join [{os.getenv('BOT_USERNAME','')}]")
+    log.info("Starting Join bot…")
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
