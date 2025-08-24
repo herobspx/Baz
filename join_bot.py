@@ -1,324 +1,303 @@
-# join_bot.py
-# -*- coding: utf-8 -*-
+# join_bot.py  (Aiogram 2.25.1)
 
 import os
+import logging
 import asyncio
-import sqlite3
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # احتياط للبيئات القديمة
 
 from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatInviteLink
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.utils.callback_data import CallbackData
 
-# ===================== الإعدادات =====================
-TOKEN = os.getenv("JOIN_TOKEN")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("join-bot")
+
+# =======================
+# متغيرات البيئة المطلوبة
+# =======================
+JOIN_TOKEN = os.getenv("JOIN_TOKEN", "").strip()
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")
-TZ_NAME = os.getenv("TZ", "Asia/Riyadh")
 
-# بيانات الدفع
 BANK_NAME = os.getenv("BANK_NAME", "البنك العربي الوطني")
 ACCOUNT_NAME = os.getenv("ACCOUNT_NAME", "بدر محمد الجعيد")
-IBAN = os.getenv("IBAN", "SA1630100991104930184574")
+IBAN_NUMBER = os.getenv("IBAN_NUMBER", "SA1630100991104930184574")
 
-# الخطط (لا تعدّل الأزرار؛ عدّل القيم هنا فقط)
+TZ_NAME = os.getenv("TZ_NAME", "Asia/Riyadh")
+TZ = ZoneInfo(TZ_NAME)
+
 PLAN_MONTH_DAYS = int(os.getenv("PLAN_MONTH_DAYS", "30"))
-PLAN_MONTH_PRICE = os.getenv("PLAN_MONTH_PRICE", "180")
+PLAN_MONTH_PRICE = int(os.getenv("PLAN_MONTH_PRICE", "180"))
 PLAN_2WEEKS_DAYS = int(os.getenv("PLAN_2WEEKS_DAYS", "14"))
-PLAN_2WEEKS_PRICE = os.getenv("PLAN_2WEEKS_PRICE", "90")
+PLAN_2WEEKS_PRICE = int(os.getenv("PLAN_2WEEKS_PRICE", "90"))
 
-if not TOKEN:
-    raise RuntimeError("JOIN_TOKEN is missing.")
-if not TARGET_CHAT_ID or not str(TARGET_CHAT_ID).startswith("-100"):
-    raise RuntimeError("TARGET_CHAT_ID invalid (must start with -100...).")
+if not JOIN_TOKEN:
+    raise RuntimeError("JOIN_TOKEN is missing. Set it in Render > Environment.")
+
+if not TARGET_CHAT_ID:
+    raise RuntimeError("TARGET_CHAT_ID is missing. Set it in Render > Environment.")
+
 if not ADMIN_ID:
-    raise RuntimeError("ADMIN_ID is missing.")
+    logger.warning("ADMIN_ID غير مضبوط — تأكيد الاشتراكات اليدوي لن يرسل تنبيهات للمشرف.")
 
-tz = ZoneInfo(TZ_NAME)
-bot = Bot(token=TOKEN, parse_mode=types.ParseMode.HTML, disable_web_page_preview=True)
+bot = Bot(token=JOIN_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
-# ===================== قاعدة البيانات =====================
-DB_PATH = "subs.db"
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS users(
-  user_id INTEGER PRIMARY KEY,
-  expires_at TEXT
-)""")
-c.execute("""
-CREATE TABLE IF NOT EXISTS pending(
-  request_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  photo_file_id TEXT,
-  caption TEXT,
-  plan_days INTEGER,
-  plan_price TEXT,
-  created_at TEXT
-)""")
-c.execute("""
-CREATE TABLE IF NOT EXISTS plan_choice(
-  user_id INTEGER PRIMARY KEY,
-  plan_days INTEGER,
-  plan_price TEXT,
-  chosen_at TEXT
-)""")
-conn.commit()
+# =======================
+# حالة مؤقتة في الذاكرة
+# (يفضّل DB للإنتاج)
+# =======================
+# تفضيل المستخدم: آخر خطة اختارها (أيام/سعر)
+last_choice = {}       # user_id -> {"days": int, "price": int}
+# تواريخ انتهاء الاشتراكات
+subscriptions = {}     # user_id -> datetime (timezone=TZ)
 
-# ===================== أدوات =====================
-def now_ksa() -> datetime:
-    return datetime.now(tz)
+# CB factories
+approve_cb = CallbackData("appr", "uid", "days")   # موافقة مشرف
+reject_cb  = CallbackData("rejt", "uid")           # رفض مشرف
 
-def fmt_dt(dt: datetime) -> str:
-    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
 
-def add_or_update_user(user_id: int, expires_at: datetime):
-    c.execute("""
-      INSERT INTO users(user_id, expires_at) VALUES(?, ?)
-      ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at
-    """, (user_id, expires_at.isoformat()))
-    conn.commit()
+# ========= رسائل ثابتة =========
+WELCOME_TEXT = (
+    "مرحباً 👋\n"
+    "هذا البوت يقدّم لك اشتراكاً مباشراً في قناة إشارات عقود SPX.\n"
+    "اختر مدة الاشتراك، ادفع عبر التحويل البنكي، ثم أرسل صورة التأكيد — والبوت يتكفّل بالباقي."
+)
 
-def get_user_expiry(user_id: int):
-    row = c.execute("SELECT expires_at FROM users WHERE user_id=?", (user_id,)).fetchone()
-    if row:
-        return datetime.fromisoformat(row[0]).astimezone(tz)
-    return None
+PROTECTION_NOTE = (
+    "🔒 ملاحظة أمان:\n"
+    "• لا تشارك توكنات أو روابط دعوة خاصة بك مع أي جهة.\n"
+    "• تأكد أن التحويل البنكي على الحساب الصحيح.\n"
+    "• لن نطلب كلمات مرور أو رموز تحقق مطلقاً."
+)
 
-def remove_user(user_id: int):
-    c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-    conn.commit()
-
-def set_plan_choice(user_id: int, days: int, price: str):
-    c.execute("""
-      INSERT INTO plan_choice(user_id, plan_days, plan_price, chosen_at) VALUES(?, ?, ?, ?)
-      ON CONFLICT(user_id) DO UPDATE SET plan_days=excluded.plan_days, plan_price=excluded.plan_price, chosen_at=excluded.chosen_at
-    """, (user_id, days, price, now_ksa().isoformat()))
-    conn.commit()
-
-def get_plan_choice(user_id: int):
-    row = c.execute("SELECT plan_days, plan_price FROM plan_choice WHERE user_id=?", (user_id,)).fetchone()
-    return (row[0], row[1]) if row else (None, None)
-
-def clear_plan_choice(user_id: int):
-    c.execute("DELETE FROM plan_choice WHERE user_id=?", (user_id,))
-    conn.commit()
-
-def add_pending(user_id: int, file_id: str, caption: str, plan_days: int, plan_price: str):
-    c.execute("""
-      INSERT INTO pending(user_id, photo_file_id, caption, plan_days, plan_price, created_at)
-      VALUES(?, ?, ?, ?, ?, ?)
-    """, (user_id, file_id, caption or "", plan_days, plan_price, now_ksa().isoformat()))
-    conn.commit()
-    return c.lastrowid
-
-def get_pending(request_id: int):
-    return c.execute("""
-      SELECT request_id, user_id, photo_file_id, caption, plan_days, plan_price, created_at
-      FROM pending WHERE request_id=?
-    """, (request_id,)).fetchone()
-
-def del_pending(request_id: int):
-    c.execute("DELETE FROM pending WHERE request_id=?", (request_id,))
-    conn.commit()
-
-def plan_keyboard():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton(f"اشتراك شهر — {PLAN_MONTH_PRICE} ريال", callback_data=f"plan:{PLAN_MONTH_DAYS}:{PLAN_MONTH_PRICE}"),
-        InlineKeyboardButton(f"اشتراك أسبوعين — {PLAN_2WEEKS_PRICE} ريال", callback_data=f"plan:{PLAN_2WEEKS_DAYS}:{PLAN_2WEEKS_PRICE}")
-    )
+def main_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 الاشتراك الشهري — 180 ر.س", callback_data="plan_month")],
+        [InlineKeyboardButton(text="🗓️ اشتراك أسبوعين — 90 ر.س", callback_data="plan_2weeks")],
+        [InlineKeyboardButton(text="💳 طريقة الدفع", callback_data="pay_info")],
+        [InlineKeyboardButton(text="🔁 تجديد الاشتراك", callback_data="renew")],
+        [InlineKeyboardButton(text="📄 حالة اشتراكي", callback_data="status")],
+        [InlineKeyboardButton(text="🆘 مساعدة", callback_data="help")]
+    ])
     return kb
 
-def pay_text(amount: str):
+def payment_instructions(days: int, price: int) -> str:
     return (
-        "<b>طريقة الاشتراك 🧾</b>\n"
-        f"قيمة الاشتراك: <b>{amount} ريال</b>\n"
-        f"<b>البنك:</b> {BANK_NAME}\n"
-        f"<b>اسم صاحب الحساب:</b> {ACCOUNT_NAME}\n"
-        f"<b>الآيبان:</b> <code>{IBAN}</code>\n\n"
-        "بعد التحويل أرسل <b>صورة إيصال التحويل</b> هنا.\n"
-        "بعد التأكيد سيصلك رابط دعوة صالح لعضو واحد ✅"
+        "طريقة الاشتراك 🧾\n"
+        f"حوِّل الرسوم (<b>{price} ريال</b>) إلى الحساب المحدد:\n"
+        f"• البنك: <b>{BANK_NAME}</b>\n"
+        f"• اسم صاحب الحساب: <b>{ACCOUNT_NAME}</b>\n"
+        f"• الآيبان: <code>{IBAN_NUMBER}</code>\n\n"
+        "ثم أرسل <b>صورة إيصال التحويل</b> هنا.\n"
+        f"بعد التأكيد سيُرسَل لك رابط دعوة صالح لعضو واحد لمدة <b>{days} يومًا</b>.\n\n"
+        f"{PROTECTION_NOTE}"
     )
 
-def start_text():
-    return (
-        "مرحباً 👋\n"
-        "اختر مدة الاشتراك المناسبة، ثم اتبع تعليمات الدفع وأرسل صورة إيصال التحويل هنا.\n"
-    )
+def fmt_dt(dt: datetime) -> str:
+    # تاريخ بصيغة ودّية بتوقيت السعودية
+    return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M (%Z)")
 
-async def try_create_invite_link() -> str | None:
-    if CHANNEL_LINK:
-        return CHANNEL_LINK
+
+# ========= أوامر /start =========
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+
+
+# ========= أزرار القائمة =========
+@dp.callback_query_handler(lambda c: c.data == "plan_month")
+async def choose_month(call: CallbackQuery):
+    last_choice[call.from_user.id] = {"days": PLAN_MONTH_DAYS, "price": PLAN_MONTH_PRICE}
+    await call.message.answer(payment_instructions(PLAN_MONTH_DAYS, PLAN_MONTH_PRICE))
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "plan_2weeks")
+async def choose_2weeks(call: CallbackQuery):
+    last_choice[call.from_user.id] = {"days": PLAN_2WEEKS_DAYS, "price": PLAN_2WEEKS_PRICE}
+    await call.message.answer(payment_instructions(PLAN_2WEEKS_DAYS, PLAN_2WEEKS_PRICE))
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "pay_info")
+async def pay_info(call: CallbackQuery):
+    txt = (
+        "💳 طريقة الدفع\n"
+        f"• البنك: <b>{BANK_NAME}</b>\n"
+        f"• اسم صاحب الحساب: <b>{ACCOUNT_NAME}</b>\n"
+        f"• الآيبان: <code>{IBAN_NUMBER}</code>\n\n"
+        "بعد التحويل أرسل صورة الإيصال هنا للمراجعة.\n\n"
+        f"{PROTECTION_NOTE}"
+    )
+    await call.message.answer(txt)
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "renew")
+async def renew(call: CallbackQuery):
+    # التجديد = نفس خيارات المدد
+    await call.message.answer("اختر مدة التجديد:", reply_markup=main_menu_kb())
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "status")
+async def status(call: CallbackQuery):
+    uid = call.from_user.id
+    exp = subscriptions.get(uid)
+    if exp:
+        await call.message.answer(f"📄 حالة اشتراكك\nينتهي في: <b>{fmt_dt(exp)}</b>")
+    else:
+        await call.message.answer("لا توجد بيانات اشتراك محفوظة.\n"
+                                  "إن كنت قد دفعت بالفعل، أرسل صورة الإيصال هنا.")
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "help")
+async def help_btn(call: CallbackQuery):
+    await call.message.answer(
+        "🆘 مساعدة\n"
+        "1) اختر مدة الاشتراك.\n"
+        "2) حوّل الرسوم ثم أرسل صورة الإيصال هنا.\n"
+        "3) بعد التأكيد يصلك رابط الدعوة.\n\n"
+        f"{PROTECTION_NOTE}"
+    )
+    await call.answer()
+
+
+# ========= استقبال صورة الإيصال =========
+@dp.message_handler(content_types=types.ContentTypes.PHOTO)
+async def handle_receipt(message: types.Message):
+    uid = message.from_user.id
+    choice = last_choice.get(uid, {"days": PLAN_MONTH_DAYS, "price": PLAN_MONTH_PRICE})
+    days = choice["days"]
+    price = choice["price"]
+
+    await message.reply("✅ تم استلام التأكيد.\n"
+                        "جاري انتظار موافقة المشرف...")
+
+    if ADMIN_ID:
+        # أرسل للمشرف الصورة + أزرار موافقة/رفض
+        caption = (
+            f"طلب اشتراك جديد:\n"
+            f"المستخدم: <b>{message.from_user.full_name}</b> (ID: <code>{uid}</code>)\n"
+            f"الخطة: <b>{days} يوم</b> — <b>{price} ريال</b>\n\n"
+            "اعتمد الطلب لإرسال رابط الدعوة."
+        )
+        kb = InlineKeyboardMarkup().add(
+            InlineKeyboardButton("✅ اعتماد", callback_data=approve_cb.new(uid=str(uid), days=str(days))),
+            InlineKeyboardButton("❌ رفض", callback_data=reject_cb.new(uid=str(uid)))
+        )
+        file_id = message.photo[-1].file_id
+        try:
+            await bot.send_photo(chat_id=ADMIN_ID, photo=file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            logger.exception("فشل إرسال تنبيه للمشرف: %s", e)
+
+
+# ========= موافقة/رفض المشرف =========
+@dp.callback_query_handler(approve_cb.filter())
+async def admin_approve(call: CallbackQuery, callback_data: dict):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("غير مسموح", show_alert=True)
+        return
+
+    uid = int(callback_data["uid"])
+    days = int(callback_data["days"])
     try:
-        link: ChatInviteLink = await bot.create_chat_invite_link(
+        # إنشاء رابط دعوة صالح لعضو واحد، لمدة قصيرة (10 دقائق)
+        invite = await bot.create_chat_invite_link(
             chat_id=TARGET_CHAT_ID,
             member_limit=1,
-            expire_date=int((now_ksa() + timedelta(hours=6)).timestamp()),
-            name="AutoInvite"
+            expire_date=int((datetime.now(tz=TZ) + timedelta(minutes=10)).timestamp())
         )
-        return link.invite_link
-    except Exception:
-        return None
-
-# ===================== الأوامر العامة =====================
-@dp.message_handler(commands=["start"])
-async def cmd_start(m: types.Message):
-    await m.reply(start_text(), reply_markup=plan_keyboard())
-
-@dp.callback_query_handler(lambda q: q.data.startswith("plan:"))
-async def on_choose_plan(q: types.CallbackQuery):
-    _, days_str, price = q.data.split(":")
-    days = int(days_str)
-    set_plan_choice(q.from_user.id, days, price)
-    await q.message.answer(
-        "تم اختيار الخطة ✅\n" +
-        (f"الخطة: شهر ({PLAN_MONTH_PRICE} ريال)" if days == PLAN_MONTH_DAYS else f"الخطة: أسبوعين ({PLAN_2WEEKS_PRICE} ريال)")
-    )
-    await q.message.answer(pay_text(price))
-
-# ===================== استقبال إيصال التحويل =====================
-@dp.message_handler(content_types=types.ContentTypes.PHOTO)
-async def handle_receipt(m: types.Message):
-    # لازم يكون اختار خطة أولاً
-    plan_days, plan_price = get_plan_choice(m.from_user.id)
-    if not plan_days:
-        await m.reply("يرجى اختيار مدة الاشتراك أولاً من الأزرار، ثم أرسل صورة الإيصال.")
+        link = invite.invite_link
+    except Exception as e:
+        logger.exception("فشل إنشاء رابط الدعوة: %s", e)
+        await call.answer("تعذّر إنشاء رابط الدعوة", show_alert=True)
         return
 
-    rid = add_pending(m.from_user.id, m.photo[-1].file_id, m.caption or "", plan_days, plan_price)
-    await m.reply("تم استلام الإيصال ✅\nبانتظار موافقة المشرف…")
+    # حفظ موعد الانتهاء
+    expiry = datetime.now(tz=TZ) + timedelta(days=days)
+    subscriptions[uid] = expiry
 
-    caption = (
-        f"🆕 طلب اشتراك #{rid}\n"
-        f"المستخدم: {m.from_user.full_name} (ID: <code>{m.from_user.id}</code>)\n"
-        f"الخطة: {plan_days} يوم — {plan_price} ريال\n"
-        f"النص: {m.caption or '—'}"
-    )
-    kb = InlineKeyboardMarkup(row_width=2).add(
-        InlineKeyboardButton("✅ تأكيد", callback_data=f"approve:{rid}"),
-        InlineKeyboardButton("❌ رفض",  callback_data=f"reject:{rid}")
-    )
-    await bot.send_photo(ADMIN_ID, m.photo[-1].file_id, caption=caption, reply_markup=kb)
-
-# ===================== موافقة/رفض المشرف =====================
-@dp.callback_query_handler(lambda q: q.data.startswith("approve:") or q.data.startswith("reject:"))
-async def on_admin_decision(q: types.CallbackQuery):
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("للمشرف فقط.", show_alert=True)
-
-    action, rid_str = q.data.split(":")
-    rid = int(rid_str)
-    row = get_pending(rid)
-    if not row:
-        return await q.answer("الطلب غير موجود.", show_alert=True)
-
-    _, user_id, file_id, caption, plan_days, plan_price, created_at = row
-
-    if action == "reject":
-        del_pending(rid)
-        await bot.send_message(user_id, "نعتذر، تم رفض الاشتراك. راجع الإيصال أو تواصل مع الدعم.")
-        try:
-            await q.message.edit_caption(q.message.caption + "\n\n❌ تم الرفض.")
-        except Exception:
-            pass
-        return await q.answer("تم الرفض.")
-
-    # approve
-    expires = now_ksa() + timedelta(days=int(plan_days))
-    add_or_update_user(user_id, expires)
-
-    invite = await try_create_invite_link()
-    if invite:
-        await bot.send_message(
-            user_id,
-            f"تم تأكيد اشتراكك ✅\n"
-            f"الخطة: {plan_days} يوم — {plan_price} ريال\n"
-            f"تاريخ الانتهاء: <b>{fmt_dt(expires)}</b> ({TZ_NAME})\n\n"
-            f"رابط الدعوة (لعضو واحد):\n{invite}"
-        )
-        try:
-            await q.message.edit_caption(q.message.caption + f"\n\n✅ تم التأكيد — ينتهي في {fmt_dt(expires)} ({TZ_NAME})")
-        except Exception:
-            pass
-        del_pending(rid)
-        # بعد التأكيد، نحذف اختيار الخطة من الجدول (ينظّف الحالة)
-        clear_plan_choice(user_id)
-        await q.answer("تمت الموافقة.")
-    else:
-        await q.answer("تعذر إنشاء رابط تلقائي. تأكد من صلاحيات البوت أو ضع CHANNEL_LINK.", show_alert=True)
-
-# ===================== أوامر المشرف الاختيارية =====================
-@dp.message_handler(commands=["members"])
-async def cmd_members(m: types.Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-    rows = c.execute("SELECT user_id, expires_at FROM users ORDER BY expires_at").fetchall()
-    if not rows:
-        return await m.reply("لا يوجد مشتركين مسجلين.")
-    lines = []
-    for uid, ex in rows:
-        dt = datetime.fromisoformat(ex).astimezone(tz)
-        lines.append(f"{uid} — ينتهي: {fmt_dt(dt)}")
-    await m.reply("المشتركون:\n" + "\n".join(lines))
-
-@dp.message_handler(commands=["remove"])
-async def cmd_remove(m: types.Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-    args = m.get_args().strip().split()
-    if not args:
-        return await m.reply("الاستخدام: /remove USER_ID")
-    uid = int(args[0])
+    # إرسال الرابط للمستخدم
     try:
-        await bot.kick_chat_member(TARGET_CHAT_ID, uid)
-        await bot.unban_chat_member(TARGET_CHAT_ID, uid)
-    except Exception:
-        pass
-    remove_user(uid)
-    await m.reply(f"تمت إزالة {uid}.")
+        await bot.send_message(
+            chat_id=uid,
+            text=(
+                "✅ تم اعتماد طلبك.\n"
+                f"هذا رابط الدعوة (صالح لعضو واحد ولفترة محدودة):\n{link}\n\n"
+                f"ستنتهي عضويتك في: <b>{fmt_dt(expiry)}</b>."
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.exception("تعذّر إرسال الرابط للمستخدم: %s", e)
 
-# ===================== مراقبة الانتهاء والتنبيهات =====================
-async def expiry_watcher():
-    notified = set()  # (user_id, expires_iso) لمنع تكرار التنبيه قبل يومين
-    while True:
+    await call.answer("تم الاعتماد وإرسال الرابط.")
+    await call.message.edit_reply_markup()
+
+    # جدولة إزالة العضو عند الانتهاء (أفضل استخدام DB + job runner للإنتاج)
+    dp.loop.create_task(remove_when_expired(uid, expiry))
+
+
+@dp.callback_query_handler(reject_cb.filter())
+async def admin_reject(call: CallbackQuery, callback_data: dict):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("غير مسموح", show_alert=True)
+        return
+
+    uid = int(callback_data["uid"])
+    try:
+        await bot.send_message(uid, "❌ لم يتم اعتماد الطلب. الرجاء مراجعة بيانات التحويل والمحاولة من جديد.")
+    except Exception as e:
+        logger.exception("تعذّر إبلاغ المستخدم بالرفض: %s", e)
+
+    await call.answer("تم الرفض.")
+    await call.message.edit_reply_markup()
+
+
+# ========= مهمة إزالة العضو عند الانتهاء + تنبيه قبل يومين =========
+async def remove_when_expired(user_id: int, expiry: datetime):
+    try:
+        # تنبيه قبل يومين
+        warn_at = expiry - timedelta(days=2)
+        now = datetime.now(tz=TZ)
+        if warn_at > now:
+            await asyncio.sleep((warn_at - now).total_seconds())
+            try:
+                await bot.send_message(user_id,
+                    f"⏰ تذكير: ستنتهي عضويتك بعد يومين في <b>{fmt_dt(expiry)}</b>.\n"
+                    "يمكنك التجديد من زر <b>🔁 تجديد الاشتراك</b>.", parse_mode="HTML")
+            except Exception:
+                pass
+
+        # الانتظار حتى الانتهاء
+        now = datetime.now(tz=TZ)
+        if expiry > now:
+            await asyncio.sleep((expiry - now).total_seconds())
+
+        # إزالة العضو من المجموعة (إن كان مجموعة/سوبرجروب)
         try:
-            rows = c.execute("SELECT user_id, expires_at FROM users").fetchall()
-            now = now_ksa()
-            for uid, ex in rows:
-                dt = datetime.fromisoformat(ex).astimezone(tz)
+            await bot.kick_chat_member(TARGET_CHAT_ID, user_id)
+            await bot.unban_chat_member(TARGET_CHAT_ID, user_id)  # إلغاء الحظر للسماح بدعوات لاحقة
+        except Exception as e:
+            logger.warning("تعذّرت الإزالة (قد تكون قناة/أذونات): %s", e)
 
-                # تذكير قبل يومين
-                if 0 < (dt - now).total_seconds() <= 2*24*3600:
-                    key = (uid, ex)
-                    if key not in notified:
-                        try:
-                            await bot.send_message(uid, f"⏰ تذكير: سينتهي اشتراكك بعد أقل من يومين في {fmt_dt(dt)} ({TZ_NAME}).")
-                        except Exception:
-                            pass
-                        notified.add(key)
-
-                # الانتهاء وإزالة العضو
-                if now >= dt:
-                    try:
-                        await bot.kick_chat_member(TARGET_CHAT_ID, uid)
-                        await bot.unban_chat_member(TARGET_CHAT_ID, uid)
-                    except Exception:
-                        pass
-                    remove_user(uid)
-                    try:
-                        await bot.send_message(uid, "⛔️ انتهى اشتراكك. لإعادة الاشتراك ابدأ من جديد بـ /start.")
-                    except Exception:
-                        pass
+        subscriptions.pop(user_id, None)
+        try:
+            await bot.send_message(user_id, "⛔ انتهى اشتراكك وتمت إزالتك من المجموعة. يمكنك التجديد من القائمة.")
         except Exception:
             pass
-        await asyncio.sleep(60)
+    except Exception as e:
+        logger.exception("خطأ في مهمة الإنهاء: %s", e)
 
-# ===================== تشغيل =====================
+
+# ========= بدء التشغيل =========
 async def on_startup(_):
-    asyncio.create_task(expiry_watcher())
+    logger.info("Starting Join bot…")
+    # لا يوجد استرجاع من DB هنا؛ إن رغبت أضف تحميل اشتراكاتك من قاعدة بيانات.
+
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
