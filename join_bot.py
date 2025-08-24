@@ -1,146 +1,119 @@
-# join_bot.py
 import os
-import asyncio
-import time
-import aiosqlite
-from contextlib import suppress
+import logging
+from datetime import timedelta, datetime
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
-                           InlineKeyboardButton)
-from aiogram.enums import ParseMode
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
-JOIN_TOKEN = os.getenv("JOIN_TOKEN")  # اجباري
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))  # اجباري: اكتب رقم الجروب/القناة
-SUB_DURATION_DAYS = int(os.getenv("SUB_DURATION_DAYS", "30"))  # مدة الاشتراك بالايام
+# ===== إعدادات عامة =====
+logging.basicConfig(level=logging.INFO)
+
+JOIN_TOKEN = os.getenv("JOIN_TOKEN")
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
+CHANNEL_LINK = os.getenv("CHANNEL_LINK")  # رابط عام ثابت كخطة بديلة
 
 if not JOIN_TOKEN:
     raise RuntimeError("JOIN_TOKEN is missing. Set it in Render > Environment.")
-if TARGET_CHAT_ID == 0:
+if not TARGET_CHAT_ID:
     raise RuntimeError("TARGET_CHAT_ID is missing. Set it in Render > Environment.")
+# CHANNEL_LINK اختياري لكنه مفيد كخطة بديلة
 
-DB_PATH = "subs.db"
+# بوت و دسباتشر
+bot = Bot(token=JOIN_TOKEN)
+dp = Dispatcher(bot)
 
-bot = Bot(token=JOIN_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+# كيبورد الاشتراك
+btn_subscribe = KeyboardButton("الاشتراك 🟢")
+kb_subscribe = ReplyKeyboardMarkup(resize_keyboard=True)
+kb_subscribe.add(btn_subscribe)
 
+# نصوص عربية
+WELCOME_TEXT = (
+    "مرحبًا 👋\n"
+    "للاشتراك اضغط الزر التالي، وستظهر لك طريقة الاشتراك.\n"
+    "بعد التحويل أرسل صورة تأكيد هنا."
+)
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS subs (
-                user_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                PRIMARY KEY (user_id, chat_id)
-            )
-        """)
-        await db.commit()
+SUBSCRIBE_INSTRUCTIONS = (
+    "طريقة الاشتراك 🧾\n"
+    "حوِّل الرسوم 180 ريال إلى البنك العربي الوطني الآيبان /SA1630100991104930184574 ثم أرسل صورة إيصال التحويل هنا.\n\n"
+    "بعد التأكيد سترسل لك المنظومة رابط الدعوة صالح لعضو واحد ✅"
+)
 
+SUCCESS_TEXT = "تم استلام التأكيد ✅\nجاري إنشاء رابط الدعوة…"
 
-async def schedule_kick(user_id: int, chat_id: int, expires_at: int):
-    """يجدول طرد المستخدم عند إنتهاء الاشتراك."""
-    delay = max(0, expires_at - int(time.time()))
-    await asyncio.sleep(delay)
-    # طرد ثم إلغاء الحظر ليسمح بإعادة الاشتراك لاحقاً
-    with suppress(Exception):
-        await bot.ban_chat_member(chat_id, user_id)
-    await asyncio.sleep(1)
-    with suppress(Exception):
-        await bot.unban_chat_member(chat_id, user_id)
-    # حذف السجل من القاعدة
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM subs WHERE user_id=? AND chat_id=?", (user_id, chat_id))
-        await db.commit()
+ERROR_NO_LINK_TEXT = (
+    "تم التأكيد ✅\n"
+    "تعذر إنشاء رابط دعوة تلقائي (يبدو أن البوت ليس مشرفًا أو لا يملك صلاحية الدعوة).\n"
+)
 
-
-async def restore_schedules():
-    """إعادة جدولة كل الاشتراكات غير المنتهية بعد إعادة تشغيل البوت."""
-    now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, chat_id, expires_at FROM subs WHERE expires_at > ?", (now,)) as cur:
-            async for user_id, chat_id, expires_at in cur:
-                asyncio.create_task(schedule_kick(user_id, chat_id, expires_at))
-
-
-def sub_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🟢 الاشتراك", callback_data="subscribe")
-    ]])
-    return kb
-
-
-@dp.message(CommandStart())
-async def start_cmd(msg: Message):
-    text = (
-        "مرحباً 👋\n"
-        "للاشتراك اضغط الزر التالي، وستظهر لك طريقة الاشتراك.\n"
-        "بعد التحويل أرسل <b>صورة تأكيد</b> هنا."
-    )
-    await msg.answer(text, reply_markup=sub_keyboard())
-
-
-@dp.callback_query(F.data == "subscribe")
-async def show_payment_info(cb: CallbackQuery):
-    text = (
-        "💳 <b>طريقة الاشتراك</b>\n"
-        "حوّل الرسوم ١٨٠ ريال إلى الحساب المحدد (البنك العربي الوطني الآيبان / SA1630100991104930184574)\n"
-        "ثم أرسل <b>صورة</b> إيصال التحويل هنا.\n\n"
-        "بعد التأكيد سترسل لك المنظومة رابط دعوة صالح لعضو واحد ✅"
-    )
-    await cb.message.answer(text)
-    await cb.answer()
-
-
-@dp.message(F.photo)
-async def handle_proof(msg: Message):
-    user_id = msg.from_user.id
-
-    # صنع رابط دعوة فردي لمدة ساعة (3600 ثانية)
-    expire = int(time.time()) + 3600
-    invite = await bot.create_chat_invite_link(
-        chat_id=TARGET_CHAT_ID,
-        expire_date=expire,
+# ===== مساعد لإنشاء رابط دعوة مخصص =====
+async def make_single_use_invite(chat_id: int) -> str:
+    """
+    ينشئ رابط دعوة صالح لعضو واحد مع صلاحية انتهاء بعد 24 ساعة.
+    يتطلب أن يكون البوت مشرفًا ولديه 'Invite Users'.
+    """
+    expire_dt = datetime.utcnow() + timedelta(hours=24)
+    # member_limit = 1 يجعل الرابط صالح لعضو واحد فقط
+    link = await bot.create_chat_invite_link(
+        chat_id=chat_id,
+        expire_date=expire_dt,
         member_limit=1,
-        creates_join_request=False
+        name="JoinBot single-use"
     )
+    return link.invite_link
 
-    # سجل انتهاء الاشتراك بعد المدة المحددة
-    expires_at = int(time.time()) + SUB_DURATION_DAYS * 24 * 3600
+# ===== الهاندلرز =====
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    await message.answer(WELCOME_TEXT, reply_markup=kb_subscribe)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO subs (user_id, chat_id, expires_at) VALUES (?,?,?)",
-            (user_id, TARGET_CHAT_ID, expires_at)
+@dp.message_handler(lambda m: m.text and m.text.strip() == "الاشتراك 🟢")
+async def on_subscribe(message: types.Message):
+    await message.answer(SUBSCRIBE_INSTRUCTIONS, reply_markup=kb_subscribe)
+
+@dp.message_handler(content_types=types.ContentTypes.PHOTO)
+async def on_payment_proof(message: types.Message):
+    # استلمنا صورة كإثبات
+    await message.answer(SUCCESS_TEXT)
+
+    # حاول إنشاء رابط دعوة مخصص
+    invite_url = None
+    try:
+        # تحويل TARGET_CHAT_ID إلى int إن أمكن
+        target_id = int(TARGET_CHAT_ID)
+    except ValueError:
+        # لو كان محفوظ كنص يبدأ بـ -100 نتركه كنص
+        target_id = TARGET_CHAT_ID
+
+    try:
+        invite_url = await make_single_use_invite(target_id)
+    except Exception as e:
+        logging.warning(f"Failed to create invite link automatically: {e}")
+
+    if invite_url:
+        await message.answer(
+            f"هذا رابط الدعوة الخاص بك (صالح لعضو واحد ولمدة 24 ساعة):\n{invite_url}"
         )
-        await db.commit()
+    else:
+        if CHANNEL_LINK:
+            await message.answer(
+                ERROR_NO_LINK_TEXT + f"استخدم هذا الرابط للانضمام:\n{CHANNEL_LINK}"
+            )
+        else:
+            await message.answer(
+                ERROR_NO_LINK_TEXT
+                + "لم يتم إعداد CHANNEL_LINK كخطة بديلة. "
+                  "أضف متغير CHANNEL_LINK في Render أو اجعل البوت مشرفًا ثم جرّب مجددًا."
+            )
 
-    # جدولة الطرد
-    asyncio.create_task(schedule_kick(user_id, TARGET_CHAT_ID, expires_at))
+# رسالة افتراضية لباقي النصوص
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
+async def echo_message(message: types.Message):
+    # توجيه المستخدم نحو زر الاشتراك لو أرسل نص عشوائي
+    await message.answer("أرسل صورة إيصال التحويل بعد الضغط على زر الاشتراك.", reply_markup=kb_subscribe)
 
-    # أرسل الرابط وموعد الانتهاء
-    until_str = f"{SUB_DURATION_DAYS} يوم"
-    await msg.answer(
-        "تم التحقق من الإيصال ✅\n"
-        f"هذا رابط الانضمام (صالح لساعة واحدة وعضو واحد):\n{invite.invite_link}\n\n"
-        f"⏳ مدة الاشتراك: {until_str}\n"
-        "ملاحظة: البوت يحتاج أن يكون أدمن في الجروب ليستطيع إدارة الاشتراك."
-    )
-
-
-@dp.message()
-async def fallback(msg: Message):
-    await msg.answer(
-        "✅ البوت شغّال.\n"
-        "اكتب /start ثم اضغط “الاشتراك”، وبعد الدفع أرسل <b>صورة</b> تأكيد هنا."
-    )
-
-
-async def main():
-    await init_db()
-    await restore_schedules()
-    await dp.start_polling(bot)
-
+# ===== التشغيل =====
 if __name__ == "__main__":
-    asyncio.run(main())
+    # في Render استخدم Start Command: python3 join_bot.py
+    executor.start_polling(dp, skip_updates=True)
